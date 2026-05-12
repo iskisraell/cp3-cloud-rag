@@ -1,0 +1,6 @@
+{
+  "name": "FIAP CP Cloud Chat",
+  "description": "ChatGPT-style RAG frontend for document chat, featuring FIAP design tokens.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
