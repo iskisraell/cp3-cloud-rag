@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 import psycopg
 import os
 from dotenv import load_dotenv
@@ -6,8 +6,9 @@ import numpy as np
 import threading
 import torch
 import re
+import json
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from flask_cors import CORS
 import PyPDF2
 
@@ -81,29 +82,38 @@ def _do_warmup():
     except Exception as e:
         print(f"Warmup failed: {e}")
 
-def generate_answer(context, question, history=None):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+# --- Shared helpers ---
+
+def build_messages(context, question, history=None):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         for turn in history[-4:]:
             if turn.get('role') in ('user', 'assistant'):
                 messages.append({"role": turn['role'], "content": turn['content']})
-
     user_msg = (
         "CONTEXTO:\n<<<\n" + context + "\n>>>\n\n"
         "PERGUNTA: " + question + "\n\n"
         "RESPOSTA EXTRAIDA DO CONTEXTO:"
     )
     messages.append({"role": "user", "content": user_msg})
+    return messages
 
+
+def tokenize_messages(messages):
     text = llm_tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
     )
     inputs = llm_tokenizer(text, return_tensors="pt")
-
     max_input_tokens = 4096
     if inputs["input_ids"].shape[1] > max_input_tokens:
         inputs = {key: value[:, -max_input_tokens:] for key, value in inputs.items()}
+    return inputs
+
+
+def generate_answer(context, question, history=None):
+    messages = build_messages(context, question, history)
+    inputs = tokenize_messages(messages)
 
     with torch.no_grad():
         outputs = llm_model.generate(
@@ -116,8 +126,76 @@ def generate_answer(context, question, history=None):
 
     input_length = inputs["input_ids"].shape[1]
     response = llm_tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
-    response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+    response = re.sub(r"<think.*?>.*?</think\s*>", "", response, flags=re.DOTALL)
     return response.strip().strip("'\"")
+
+
+def generate_stream(context, question, history=None):
+    messages = build_messages(context, question, history)
+    inputs = tokenize_messages(messages)
+
+    streamer = TextIteratorStreamer(
+        llm_tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+
+    generation_kwargs = {
+        **inputs,
+        "max_new_tokens": 512,
+        "do_sample": False,
+        "repetition_penalty": 1.15,
+        "pad_token_id": llm_tokenizer.eos_token_id,
+        "streamer": streamer,
+    }
+
+    thread = threading.Thread(target=llm_model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    for token in streamer:
+        cleaned = re.sub(r"<think.*?>.*?</think\s*>", "", token, flags=re.DOTALL)
+        if cleaned:
+            yield cleaned
+    thread.join()
+
+
+def retrieve_context(question, doc_id=None):
+    q_emb = get_embedding(question)
+    vector_str = '[' + ','.join(str(x) for x in q_emb.tolist()) + ']'
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if doc_id:
+                cur.execute(
+                    "WITH latest_chunks AS ("
+                    "SELECT DISTINCT ON (chunk_index) filename, content, chunk_index, embedding "
+                    "FROM documents "
+                    "WHERE filename = (SELECT filename FROM documents WHERE id = %s) "
+                    "ORDER BY chunk_index, id DESC"
+                    ") "
+                    "SELECT filename, content, embedding <-> %s::vector AS distance "
+                    "FROM latest_chunks "
+                    "ORDER BY embedding <-> %s::vector ASC LIMIT 3",
+                    (doc_id, vector_str, vector_str)
+                )
+            else:
+                cur.execute(
+                    "WITH latest_chunks AS ("
+                    "SELECT DISTINCT ON (filename, chunk_index) filename, content, embedding "
+                    "FROM documents "
+                    "ORDER BY filename, chunk_index, id DESC"
+                    ") "
+                    "SELECT filename, content, embedding <-> %s::vector AS distance "
+                    "FROM latest_chunks ORDER BY embedding <-> %s::vector ASC LIMIT 3",
+                    (vector_str, vector_str)
+                )
+            results = cur.fetchall()
+
+    if not results:
+        return None, []
+
+    context = "\n\n".join(r[1] for r in results)
+    sources = [{'filename': r[0], 'distance': float(r[2])} for r in results]
+    return context, sources
+
 
 # --- Chunking ---
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -285,48 +363,42 @@ def chat():
     if not question:
         return jsonify({'error': 'No question provided'}), 400
 
-    q_emb = get_embedding(question)
-    vector_str = '[' + ','.join(str(x) for x in q_emb.tolist()) + ']'
+    context, sources = retrieve_context(question, doc_id)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            if doc_id:
-                cur.execute(
-                    "WITH latest_chunks AS ("
-                    "SELECT DISTINCT ON (chunk_index) filename, content, chunk_index, embedding "
-                    "FROM documents "
-                    "WHERE filename = (SELECT filename FROM documents WHERE id = %s) "
-                    "ORDER BY chunk_index, id DESC"
-                    ") "
-                    "SELECT filename, content, embedding <-> %s::vector AS distance "
-                    "FROM latest_chunks "
-                    "ORDER BY embedding <-> %s::vector ASC LIMIT 3",
-                    (doc_id, vector_str, vector_str)
-                )
-            else:
-                cur.execute(
-                    "WITH latest_chunks AS ("
-                    "SELECT DISTINCT ON (filename, chunk_index) filename, content, embedding "
-                    "FROM documents "
-                    "ORDER BY filename, chunk_index, id DESC"
-                    ") "
-                    "SELECT filename, content, embedding <-> %s::vector AS distance "
-                    "FROM latest_chunks ORDER BY embedding <-> %s::vector ASC LIMIT 3",
-                    (vector_str, vector_str)
-                )
-            results = cur.fetchall()
-
-    if not results:
+    if context is None:
         return jsonify({
             'answer': 'Nenhum documento encontrado para responder essa pergunta.',
             'sources': []
         })
 
-    context = "\n\n".join(r[1] for r in results)
-    sources = [{'filename': r[0], 'distance': float(r[2])} for r in results]
     answer = generate_answer(context, question, history=history)
-
     return jsonify({'answer': answer, 'sources': sources})
+
+
+@app.route('/chat/stream', methods=['POST'])
+def chat_stream():
+    data = request.get_json()
+    question = data.get('question', '')
+    doc_id = data.get('doc_id')
+    history = data.get('history', [])
+    if not question:
+        return jsonify({'error': 'No question provided'}), 400
+
+    context, sources = retrieve_context(question, doc_id)
+
+    if context is None:
+        def no_results():
+            yield f"data: {json.dumps({'error': 'Nenhum documento encontrado.'})}\n\n"
+        return Response(no_results(), mimetype='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+    def event_stream():
+        for token in generate_stream(context, question, history):
+            yield f"data: {json.dumps({'token': token})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'sources': sources})}\n\n"
+
+    return Response(event_stream(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True, use_reloader=False)
